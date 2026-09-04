@@ -155,6 +155,8 @@ def get_device_type() -> str:
         return "npu"
     if hasattr(torch, "xpu") and torch.xpu.is_available():
         return "xpu"
+    if hasattr(torch, "musa") and torch.musa.is_available():
+        return "musa"
     return "cpu"
 
 
@@ -168,6 +170,8 @@ def get_local_device() -> torch.device:
         return torch.device("npu", local_rank)
     if device_type == "xpu":
         return torch.device("xpu", local_rank)
+    if device_type == "musa":
+        return torch.device("musa", local_rank)
     return torch.device("cpu")
 
 

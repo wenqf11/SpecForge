@@ -22,6 +22,7 @@ _DISTRIBUTED_BACKENDS = {
     "cuda": "nccl",
     "npu": "hccl",
     "xpu": "xccl",
+    "musa": "mccl",
 }
 
 
