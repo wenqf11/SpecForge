@@ -69,6 +69,8 @@ class StepProfiler:
         activities = [torch_profiler.ProfilerActivity.CPU]
         if torch.cuda.is_available():
             activities.append(torch_profiler.ProfilerActivity.CUDA)
+        if torch.musa.is_available():
+            activities.append(torch_profiler.ProfilerActivity.MUSA)
         self._profiler = torch_profiler.profile(
             activities=activities,
             with_stack=True,

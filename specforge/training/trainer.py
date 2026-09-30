@@ -150,6 +150,7 @@ class Trainer:
         loader_device = consumer_device() if callable(consumer_device) else None
         if not isinstance(loader_device, torch.device):
             loader_device = "cpu"
+        pin_memory = dataloader_num_workers > 0 and (torch.cuda.is_available() or torch.musa.is_available())
         loader = FeatureDataLoader(
             store,
             **ref_source,
@@ -163,7 +164,8 @@ class Trainer:
             num_workers=dataloader_num_workers,
             # Pin in the existing loader workers so Domino's non-blocking H2D
             # copies do not add pinning work to the training thread.
-            pin_memory=dataloader_num_workers > 0 and torch.cuda.is_available(),
+            #pin_memory=dataloader_num_workers > 0 and torch.cuda.is_available(),
+            pin_memory=pin_memory,
         )
         if refs_for_epoch is not None:
             expected_refs = len(ref_source["refs"])

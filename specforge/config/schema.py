@@ -899,7 +899,13 @@ class TrainingConfig(StrictConfigModel):
     total_steps: Optional[int] = Field(default=None, gt=0)
     batch_size: int = Field(default=1, gt=0)
     accumulation_steps: int = Field(default=1, gt=0)
-    fsdp_sharding: Literal["SHARD_GRAD_OP", "FULL_SHARD", "NO_SHARD"] = "SHARD_GRAD_OP"
+    fsdp_sharding: Literal[
+        "SHARD_GRAD_OP",
+        "FULL_SHARD",
+        "NO_SHARD",
+        "HYBRID_SHARD",
+        "_HYBRID_SHARD_ZERO2",
+    ] = "SHARD_GRAD_OP"
     learning_rate: float = Field(default=1e-4, gt=0.0)
     lr_scheduler: Literal["cosine", "constant"] = "cosine"
     warmup_ratio: float = Field(default=0.015, ge=0.0, le=1.0)

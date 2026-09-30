@@ -16,6 +16,9 @@ _DRAFT_DP_GROUP = None
 _DRAFT_SP_GROUP = None
 _SP_ULYSSES_GROUP = None
 _SP_RING_GROUP = None
+_HYBRID_DEVICE_MESH = None
+
+HYBRID_SHARDING_STRATEGIES = frozenset({"HYBRID_SHARD", "_HYBRID_SHARD_ZERO2"})
 
 _DISTRIBUTED_BACKENDS = {
     "cpu": "gloo",
@@ -132,6 +135,52 @@ def get_sp_ring_group():
     return _SP_RING_GROUP
 
 
+def get_hybrid_device_mesh():
+    global _HYBRID_DEVICE_MESH
+    return _HYBRID_DEVICE_MESH
+
+
+def _hybrid_shard_group_size(world_size: int) -> int:
+    """Intra-node FSDP shard size for hybrid strategies.
+
+    Torchrun sets ``LOCAL_WORLD_SIZE`` to ``nproc_per_node``. That is the shard
+    group; remaining ranks form the inter-node replication group. An explicit
+    ``FSDP_HYBRID_SHARD_SIZE`` overrides the heuristic for uneven layouts.
+    Visible-device count is not used: each rank often sees one GPU.
+    """
+    override = os.environ.get("FSDP_HYBRID_SHARD_SIZE")
+    if override:
+        size = int(override)
+    elif "LOCAL_WORLD_SIZE" in os.environ:
+        size = int(os.environ["LOCAL_WORLD_SIZE"])
+    else:
+        size = world_size
+    if size <= 0:
+        raise ValueError(
+            f"hybrid FSDP shard group size must be positive, got {size}"
+        )
+    if world_size % size != 0:
+        raise ValueError(
+            "hybrid FSDP requires world_size "
+            f"({world_size}) to be divisible by the intra-node shard size "
+            f"({size}). Set LOCAL_WORLD_SIZE to nproc_per_node, or "
+            "FSDP_HYBRID_SHARD_SIZE."
+        )
+    return size
+
+
+def _init_hybrid_device_mesh(device_type: str, world_size: int):
+    shard_size = _hybrid_shard_group_size(world_size)
+    replicate_size = world_size // shard_size
+    mesh = dist.device_mesh.init_device_mesh(
+        device_type,
+        (replicate_size, shard_size),
+        mesh_dim_names=("replicate", "shard"),
+    )
+    print_with_rank(f"hybrid FSDP mesh: {mesh}")
+    return mesh
+
+
 def init_distributed(
     timeout: int = 10, tp_size: int = 1, sp_ulysses_size: int = 1, sp_ring_size: int = 1
 ):
@@ -200,7 +249,12 @@ def init_distributed(
     # we need to create a 1D submesh
     tp_device_mesh = dist.DeviceMesh.from_group(tp_group, device_type=device_type)
 
-    global _TP_GROUP, _DP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH, _DP_DEVICE_MESH, _SP_RING_GROUP, _SP_ULYSSES_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
+    sharding_strategy = os.environ.get("FSDP_SHARDING", "SHARD_GRAD_OP")
+    hybrid_device_mesh = None
+    if sharding_strategy in HYBRID_SHARDING_STRATEGIES:
+        hybrid_device_mesh = _init_hybrid_device_mesh(device_type, world_size)
+
+    global _TP_GROUP, _DP_GROUP, _DEVICE_MESH, _TP_DEVICE_MESH, _DP_DEVICE_MESH, _SP_RING_GROUP, _SP_ULYSSES_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP, _HYBRID_DEVICE_MESH
     _DEVICE_MESH = device_mesh
     _TP_GROUP = tp_group
     _TP_DEVICE_MESH = tp_device_mesh
@@ -210,6 +264,7 @@ def init_distributed(
     _DRAFT_DP_GROUP = draft_dp_group
     _DRAFT_SP_GROUP = draft_sp_group
     _DP_DEVICE_MESH = dist.DeviceMesh.from_group(dp_group, device_type=device_type)
+    _HYBRID_DEVICE_MESH = hybrid_device_mesh
 
 
 def destroy_distributed(*, abort: bool = False):
@@ -221,7 +276,7 @@ def destroy_distributed(*, abort: bool = False):
     """
     global _DEVICE_MESH, _TP_DEVICE_MESH, _TP_GROUP
     global _DP_DEVICE_MESH, _DP_GROUP, _DRAFT_DP_GROUP, _DRAFT_SP_GROUP
-    global _SP_ULYSSES_GROUP, _SP_RING_GROUP
+    global _SP_ULYSSES_GROUP, _SP_RING_GROUP, _HYBRID_DEVICE_MESH
     # Teardown must never crash the process. Several handles can alias the same
     # underlying group (e.g. DP and draft-DP when there is no sequence
     # parallelism), and degenerate single-rank SP groups (created when
@@ -229,6 +284,15 @@ def destroy_distributed(*, abort: bool = False):
     # process-group map and would raise on destroy. Clean up each distinct,
     # valid group at most once.
     default_group = dist.group.WORLD if dist.is_initialized() else None
+    hybrid_groups = []
+    get_group = getattr(_HYBRID_DEVICE_MESH, "get_group", None)
+    ndim = getattr(_HYBRID_DEVICE_MESH, "ndim", None)
+    if callable(get_group) and isinstance(ndim, int):
+        for dim in range(ndim):
+            try:
+                hybrid_groups.append(get_group(mesh_dim=dim))
+            except Exception:
+                pass
     seen = set()
     for group in (
         _TP_GROUP,
@@ -237,6 +301,7 @@ def destroy_distributed(*, abort: bool = False):
         _SP_RING_GROUP,
         _DRAFT_DP_GROUP,
         _DRAFT_SP_GROUP,
+        *hybrid_groups,
         default_group,  # may alias the DP group; the seen-set dedups it
     ):
         if group is None or id(group) in seen:
@@ -265,6 +330,7 @@ def destroy_distributed(*, abort: bool = False):
     _DRAFT_SP_GROUP = None
     _SP_ULYSSES_GROUP = None
     _SP_RING_GROUP = None
+    _HYBRID_DEVICE_MESH = None
 
 
 def shard_tensor(

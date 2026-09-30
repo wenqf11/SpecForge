@@ -72,6 +72,7 @@ class ParallelConfig:
     draft_sp_group: Any = None
     device_mesh: Any = None
     tp_device_mesh: Any = None
+    hybrid_device_mesh: Any = None
     extra: dict = field(default_factory=dict)
 
     @property
@@ -115,6 +116,7 @@ class ParallelConfig:
                 ("draft_sp_group", "get_draft_sp_group"),
                 ("device_mesh", "get_device_mesh"),
                 ("tp_device_mesh", "get_tp_device_mesh"),
+                ("hybrid_device_mesh", "get_hybrid_device_mesh"),
             ):
                 fn = getattr(sfdist, getter, None)
                 if fn is None:
@@ -282,6 +284,8 @@ class FSDPTrainingBackend(TrainingBackend):
                 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
                 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
 
+                from specforge.distributed import HYBRID_SHARDING_STRATEGIES
+
                 sharding = getattr(ShardingStrategy, pc.sharding_strategy)
                 fsdp_kwargs = dict(
                     use_orig_params=True,
@@ -289,8 +293,21 @@ class FSDPTrainingBackend(TrainingBackend):
                         param_dtype=pc.param_dtype, buffer_dtype=torch.float32
                     ),
                     sharding_strategy=sharding,
-                    process_group=pc.fsdp_process_group,
                 )
+                if pc.sharding_strategy in HYBRID_SHARDING_STRATEGIES:
+                    # Hybrid FSDP shards intra-node and replicates inter-node.
+                    # A single ProcessGroup is rejected; the 2D mesh built by
+                    # init_distributed supplies (replicate, shard) groups.
+                    if pc.hybrid_device_mesh is None:
+                        raise ValueError(
+                            "hybrid FSDP strategies require a 2D device mesh "
+                            "from init_distributed; set training.fsdp_sharding "
+                            "before launch so FSDP_SHARDING is visible when "
+                            "process groups are created"
+                        )
+                    fsdp_kwargs["device_mesh"] = pc.hybrid_device_mesh
+                else:
+                    fsdp_kwargs["process_group"] = pc.fsdp_process_group
                 if ignored_frozen_modules:
                     fsdp_kwargs["ignored_modules"] = ignored_frozen_modules
                 if block_classes:
@@ -324,8 +341,13 @@ class FSDPTrainingBackend(TrainingBackend):
     def _configure_optimizer_grad_norm(self) -> None:
         configure = getattr(self.optimizer, "configure_grad_norm_reduction", None)
         if configure is not None:
+            process_group = self.parallel_config.fsdp_process_group
+            if self._wrapper_kind == "fsdp":
+                # Hybrid shard groups keep disjoint parameter shards only
+                # intra-node; WORLD would over-count the replicated nodes.
+                process_group = getattr(self.module, "process_group", process_group)
             configure(
-                process_group=self.parallel_config.fsdp_process_group,
+                process_group=process_group,
                 enabled=(
                     self._wrapped
                     and self.parallel_config.sharding_strategy != "NO_SHARD"
