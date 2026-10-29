@@ -269,10 +269,15 @@ class SGLangServerCaptureAdapter:
             # A task id is unique within a run, and retries happen only before
             # its ref is committed.  Keep the generation stable so a response
             # lost after the server write cannot strand gN when the retry writes
-            # gN+1.  The server patch replaces these deterministic keys on a
-            # retry (``replace``), bounding the attempt to one namespace.
+            # gN+1.  The server patch replaces these deterministic keys on every
+            # write (``replace``), bounding the attempt to one namespace AND
+            # evicting any stale object a prior run left under the same
+            # deterministic key (a leftover would otherwise make the put a
+            # silent no-op via Mooncake's OBJECT_ALREADY_EXISTS-is-success rule,
+            # and a size mismatch between ref spec and lingering object later
+            # fails every consumer get_into with INVALID_PARAMS).
             "gen": 1,
-            "replace": int(task.attempt) > 0,
+            "replace": True,
             "features": features,
             "passthrough": passthrough,
         }

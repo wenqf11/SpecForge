@@ -13,6 +13,9 @@ A checkpoint is ``{run_id}-step{N}/`` under ``output_dir``: ``training_state.pt`
 and all RNG state are rank-local; replicated DDP optimizer state is stored once
 in the shared payload. Run-scoped ``{run_id}-latest``/``{run_id}-best`` links and
 ``{run_id}.best_meta.json`` sit beside them; multi-rank runs need a shared fs.
+The best train-``acc`` snapshot is separate from that timeline: a fixed
+``{run_id}-best_train_acc/`` dir overwritten in place (meta:
+``{run_id}.best_train_acc.json``), never rewound or rotated away.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ from __future__ import annotations
 import glob
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -49,7 +53,10 @@ class CheckpointManager:
         self.best_min_delta = best_min_delta
         self.best_score: Optional[float] = None
         self.best_step: Optional[int] = None
+        self.best_train_acc: Optional[float] = None
+        self.best_train_acc_step: Optional[int] = None
         self._load_best_meta()
+        self._load_best_train_acc_meta()
 
     # -- layout ------------------------------------------------------------
     def checkpoint_dir(self, step: int) -> str:
@@ -65,6 +72,11 @@ class CheckpointManager:
     @property
     def _best_meta_path(self) -> str:
         return os.path.join(self.output_dir, f"{self.run_id}.best_meta.json")
+
+    @property
+    def best_train_acc_dir(self) -> str:
+        """Fixed overwrite target for the best train-``acc`` snapshot."""
+        return os.path.join(self.output_dir, f"{self.run_id}-best_train_acc")
 
     # -- save --------------------------------------------------------------
     def save(
@@ -210,6 +222,105 @@ class CheckpointManager:
             )
             return
         self.best_score, self.best_step = float(score), int(step)
+
+    # -- best train-acc tracking -------------------------------------------
+    @property
+    def _best_train_acc_meta_path(self) -> str:
+        return os.path.join(self.output_dir, f"{self.run_id}.best_train_acc.json")
+
+    def is_better_train_acc(self, accuracy: Optional[float]) -> bool:
+        """Rank-agreed verdict: does this log-boundary ``acc`` beat the tracked
+        best (higher wins, strictly)? Collective like :meth:`is_better`: rank0
+        decides and broadcasts, so every rank must call it together.
+        """
+        verdict = False
+        if self.is_rank0():
+            verdict = accuracy is not None and math.isfinite(float(accuracy)) and (
+                self.best_train_acc is None or accuracy > self.best_train_acc
+            )
+        return self._bcast_flag(verdict)
+
+    def save_best_train_acc(
+        self,
+        state: Optional[Dict[str, Any]],
+        step: int,
+        accuracy: float,
+        *,
+        rank_state: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Overwrite the fixed best train-``acc`` snapshot in place.
+
+        Unlike :meth:`save` this owns no timeline: no rewind (a later step-dir
+        save must never delete this snapshot) and no rotation. Rank0 rewrites
+        the shared payload and meta; every rank rewrites its rank file.
+        Collective: any rank's failure raises on all ranks.
+        """
+        valid_accuracy = self.is_rank0() and math.isfinite(float(accuracy))
+        if not self._bcast_flag(valid_accuracy):
+            raise ValueError("best train accuracy must be finite")
+        ckpt_dir = self.best_train_acc_dir
+        err = ""
+        try:
+            os.makedirs(ckpt_dir, exist_ok=True)
+            if rank_state is not None:
+                self._atomic_save(
+                    rank_state,
+                    os.path.join(ckpt_dir, self._rank_file(self._rank())),
+                )
+            if self.is_rank0() and state is not None:
+                self._atomic_save(state, self._state_path(ckpt_dir))
+            # Keep this in the collective failure domain: a rank-0-only meta
+            # write failure must reach _all_ok rather than leaving peer ranks
+            # blocked at the barrier below.
+            if self.is_rank0():
+                self._atomic_json(
+                    {
+                        "run_id": self.run_id,
+                        "step": int(step),
+                        "accuracy": float(accuracy),
+                    },
+                    self._best_train_acc_meta_path,
+                )
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+        self._all_ok(err)
+        self.best_train_acc = float(accuracy)
+        self.best_train_acc_step = int(step)
+        self._barrier()  # no rank proceeds before the snapshot is complete
+        return ckpt_dir
+
+    def _load_best_train_acc_meta(self) -> None:
+        # Rehydrate so a restart does not clobber the on-disk best with a worse
+        # accuracy. The snapshot itself is fixed-path; only the score matters.
+        try:
+            with open(self._best_train_acc_meta_path) as fh:
+                meta = json.load(fh)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError) as exc:
+            logger.warning(
+                "ignoring unreadable best train-acc meta %s: %s",
+                self._best_train_acc_meta_path,
+                exc,
+            )
+            return
+        accuracy = meta.get("accuracy")
+        step = meta.get("step")
+        if (
+            meta.get("run_id") != self.run_id
+            or not isinstance(accuracy, (int, float))
+            or not math.isfinite(float(accuracy))
+            or not isinstance(step, int)
+            or not os.path.isfile(self._state_path(self.best_train_acc_dir))
+        ):
+            logger.warning(
+                "ignoring best train-acc meta %s: run_id mismatch, malformed, "
+                "or its snapshot is gone",
+                self._best_train_acc_meta_path,
+            )
+            return
+        self.best_train_acc = float(accuracy)
+        self.best_train_acc_step = int(step)
 
     # -- load --------------------------------------------------------------
     def load(self, step: Optional[int] = None, *, map_location="cpu") -> Dict[str, Any]:

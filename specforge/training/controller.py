@@ -39,6 +39,24 @@ from specforge.training.strategies.base import (
 logger = logging.getLogger(__name__)
 
 
+def attach_note(exc: BaseException, note: str) -> None:
+    """``BaseException.add_note`` that also works on Python 3.10.
+
+    The packaged floor is 3.11, but MUSA hosts still run 3.10 where
+    ``add_note`` is missing; without the fallback the ack worker would die
+    inside its ``except`` block and leave ``flush()`` waiting forever.
+    """
+    add_note = getattr(exc, "add_note", None)
+    if add_note is not None:
+        add_note(note)
+        return
+    notes = getattr(exc, "__notes__", None)
+    if notes is None:
+        notes = []
+        exc.__notes__ = notes
+    notes.append(note)
+
+
 @dataclass(frozen=True)
 class Checkpoint:
     """A saved training checkpoint location (resume target) — deliberately NOT a
@@ -667,8 +685,8 @@ class _AsyncAckRunner:
             try:
                 self._ack_fn(sample_ids, step)
             except BaseException as exc:
-                exc.add_note(
-                    f"raised by the background durable ack of optimizer step {step}"
+                attach_note(
+                    exc, f"raised by the background durable ack of optimizer step {step}"
                 )
                 error = exc
             with self._cv:
@@ -888,9 +906,10 @@ class TrainerController:
         if primary is None:
             raise error
         if error is not primary:
-            primary.add_note(
+            attach_note(
+                primary,
                 "the background durable ack also failed: "
-                f"{type(error).__name__}: {error}"
+                f"{type(error).__name__}: {error}",
             )
 
     def _flush_durable_ack(self) -> None:
@@ -994,8 +1013,15 @@ class TrainerController:
                         self._ack_runner.submit(pending_ack, self.global_step)
                     perf_durable_ack_s += time.perf_counter() - durable_ack_started
                     pending_ack = []
+                if self.global_step % max(1, self.log_interval) == 0:
+                    # Best train-acc tracks the same cadence the log row
+                    # reports, with or without an attached tracker.
+                    self._maybe_save_best_train_acc(result.materialize_metrics())
                 if self.logger and self.global_step % max(1, self.log_interval) == 0:
                     log_metrics = dict(result.materialize_metrics())
+                    best_train_acc = self._checkpoint_manager().best_train_acc
+                    if best_train_acc is not None:
+                        log_metrics["best_train_accuracy"] = best_train_acc
                     optimizer = getattr(self.core.backend, "optimizer", None)
                     get_learning_rate = getattr(optimizer, "get_learning_rate", None)
                     if callable(get_learning_rate):
@@ -1187,6 +1213,71 @@ class TrainerController:
             self._checkpoint_mgr = CheckpointManager(self.output_dir, self.run_id)
         return self._checkpoint_mgr
 
+    def _checkpoint_payload(
+        self,
+        full: Dict[str, Any],
+        step: int,
+        replicated_optimizer: bool,
+    ) -> Dict[str, Any]:
+        # Shared rank0 payload for step checkpoints and the best train-acc
+        # snapshot alike: both must stay resume/export compatible.
+        shared = {
+            "draft_state_dict": self.core.strategy.checkpoint_state_filter(
+                full["model"]
+            ),
+            "global_step": step,
+            "epoch": self.epoch,
+            "epoch_batch": self._epoch_batch,
+            "epoch_samples": self._epoch_samples,
+            "strategy": self.core.strategy.name,
+            "run_id": self.run_id,
+            "world_size": (
+                torch.distributed.get_world_size()
+                if torch.distributed.is_initialized()
+                else 1
+            ),
+            **self.checkpoint_extra,
+        }
+        if replicated_optimizer:
+            # DDP ranks have identical parameters, gradients, optimizer
+            # moments, and scheduler state. Persist that large state once;
+            # rank files still preserve their distinct RNG streams.
+            shared["replicated_optimizer_state"] = full["optimizer"]
+        return shared
+
+    def _maybe_save_best_train_acc(self, metrics: Dict[str, float]) -> None:
+        """Overwrite the fixed best train-``acc`` snapshot when this step's
+        globally reduced ``acc`` is a new maximum.
+
+        Runs on every rank (the verdict is rank0-decided and broadcast inside
+        the manager — shard-local reductions can differ under HYBRID_SHARD —
+        and the model-state gather is collective). Strategies that report no
+        ``acc`` never trigger a snapshot.
+        """
+        accuracy = metrics.get("acc")
+        mgr = self._checkpoint_manager()
+        if not mgr.is_better_train_acc(
+            None if accuracy is None else float(accuracy)
+        ):
+            return
+        self._flush_durable_ack()
+        full = self.core.backend.state_dict()
+        replicated_optimizer = bool(
+            getattr(self.core.backend, "optimizer_state_is_replicated", False)
+        )
+        shared = None
+        if mgr.is_rank0():
+            shared = self._checkpoint_payload(full, self.global_step, replicated_optimizer)
+        mgr.save_best_train_acc(
+            shared,
+            self.global_step,
+            float(accuracy),
+            rank_state={
+                "optimizer": None if replicated_optimizer else full["optimizer"],
+                "rng": full["rng"],
+            },
+        )
+
     def save_checkpoint(self, step: int) -> Checkpoint:
         # A checkpoint must never be ahead of its durable ack: resume requires
         # the ledger marker to equal the checkpoint step.
@@ -1201,28 +1292,7 @@ class TrainerController:
         )
         shared = None
         if mgr.is_rank0():
-            shared = {
-                "draft_state_dict": self.core.strategy.checkpoint_state_filter(
-                    full["model"]
-                ),
-                "global_step": step,
-                "epoch": self.epoch,
-                "epoch_batch": self._epoch_batch,
-                "epoch_samples": self._epoch_samples,
-                "strategy": self.core.strategy.name,
-                "run_id": self.run_id,
-                "world_size": (
-                    torch.distributed.get_world_size()
-                    if torch.distributed.is_initialized()
-                    else 1
-                ),
-                **self.checkpoint_extra,
-            }
-            if replicated_optimizer:
-                # DDP ranks have identical parameters, gradients, optimizer
-                # moments, and scheduler state. Persist that large state once;
-                # rank files still preserve their distinct RNG streams.
-                shared["replicated_optimizer_state"] = full["optimizer"]
+            shared = self._checkpoint_payload(full, step, replicated_optimizer)
         ckpt_dir = mgr.save(
             shared,
             step,

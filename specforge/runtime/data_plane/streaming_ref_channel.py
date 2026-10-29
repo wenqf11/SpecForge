@@ -217,7 +217,14 @@ class StreamingRefChannel:
 
     def mark_consumer_failed(self, reason: str) -> None:
         """Tell a split producer that training failed and it must stop."""
-        self._write_sidecar(_CONSUMER_FAILED_SUFFIX, reason or "consumer failed")
+        # Multiple DP ranks can report the same distributed failure at nearly
+        # the same time.  Preserve the first terminal error instead of letting
+        # a later, secondary exception (for example a JSON parsing failure
+        # while another rank is already tearing down) overwrite the primary
+        # failure seen by the producer.
+        self._write_first_sidecar(
+            _CONSUMER_FAILED_SUFFIX, reason or "consumer failed"
+        )
 
     def consumer_failure(self) -> Optional[str]:
         """Return the consumer failure reason, if one has been published."""
@@ -294,6 +301,25 @@ class StreamingRefChannel:
             os.fsync(stream.fileno())
         os.replace(tmp, self.path + suffix)
 
+    def _write_first_sidecar(self, suffix: str, value: str) -> None:
+        """Publish a sidecar once, preserving the first writer's value."""
+        target = self.path + suffix
+        try:
+            fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            return
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(value)
+                stream.flush()
+                os.fsync(stream.fileno())
+        except BaseException:
+            try:
+                os.unlink(target)
+            except FileNotFoundError:
+                pass
+            raise
+
     def _read_sidecar(self, suffix: str) -> Optional[str]:
         try:
             with open(self.path + suffix, encoding="utf-8") as stream:
@@ -329,13 +355,22 @@ class StreamingRefChannel:
         partially written trailing line is buffered until its newline arrives, so
         a ref is never parsed half-written.
         """
+        read_offset = self._read_offset
         try:
             with open(self.path, "r") as f:
-                f.seek(self._read_offset)
+                f.seek(read_offset)
                 chunk = f.read()
-                self._read_offset = f.tell()
         except FileNotFoundError:
             chunk = ""
+        # On some shared filesystems the appender's file size can become
+        # visible before the newly written pages are readable by another
+        # client. A reader can then observe a sparse-looking NUL region in a
+        # batch that is still being written. NUL is not valid raw JSONL data
+        # (a JSON NUL must be escaped), so keep the offset unchanged and retry
+        # on the next poll instead of consuming the transient view.
+        if "\x00" in chunk:
+            return []
+        self._read_offset = read_offset + len(chunk.encode("utf-8"))
         if chunk:
             lines = (self._partial_line + chunk).split("\n")
             self._partial_line = lines.pop()
@@ -348,7 +383,16 @@ class StreamingRefChannel:
                 break
             line = self._complete_lines.popleft().strip()
             if line:
-                out.append(ref_from_dict(json.loads(line)))
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(
+                        "invalid JSONL record in "
+                        f"{self.path!r} near byte {self._read_offset}: "
+                        f"{exc.msg} at character {exc.pos}; "
+                        f"record_prefix={line[:160]!r}"
+                    ) from exc
+                out.append(ref_from_dict(payload))
         return out
 
     def mark_consumed(self, n: int) -> None:

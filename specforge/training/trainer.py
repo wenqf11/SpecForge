@@ -33,7 +33,7 @@ from specforge.algorithms.common.providers import (
 from specforge.runtime.data_plane import FeatureDataLoader, FeatureStore
 from specforge.training.backend import FSDPTrainingBackend, ParallelConfig
 from specforge.training.checkpoint import CheckpointManager
-from specforge.training.controller import TrainerController, TrainerCore
+from specforge.training.controller import TrainerController, TrainerCore, attach_note
 
 logger = logging.getLogger(__name__)
 
@@ -583,7 +583,7 @@ class Trainer:
                         f"{label} also failed during cleanup: "
                         f"{type(cleanup_error).__name__}: {cleanup_error}"
                     )
-                    primary_exception.add_note(note)
+                    attach_note(primary_exception, note)
                     logger.error(
                         "%s",
                         note,
@@ -596,11 +596,12 @@ class Trainer:
             elif cleanup_errors:
                 label, cleanup_error = cleanup_errors[0]
                 for other_label, other_error in cleanup_errors[1:]:
-                    cleanup_error.add_note(
+                    attach_note(
+                        cleanup_error,
                         f"{other_label} also failed during cleanup: "
-                        f"{type(other_error).__name__}: {other_error}"
+                        f"{type(other_error).__name__}: {other_error}",
                     )
-                cleanup_error.add_note(f"cleanup owner: {label}")
+                attach_note(cleanup_error, f"cleanup owner: {label}")
                 raise cleanup_error
 
     def save_checkpoint(self):

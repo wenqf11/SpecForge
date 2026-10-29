@@ -240,6 +240,16 @@ def _nbytes(t: torch.Tensor) -> int:
     return t.numel() * t.element_size()
 
 
+def _spec_nbytes(spec) -> int:
+    """Bytes a FeatureSpec's tensor occupies on the wire."""
+    dtype = _TORCH_DTYPES.get(spec.dtype)
+    if dtype is None:
+        raise KeyError(f"unsupported feature dtype {spec.dtype!r} for Mooncake get")
+    return torch.empty(0, dtype=dtype).element_size() * int(
+        torch.Size(tuple(int(d) for d in spec.shape)).numel()
+    )
+
+
 def _stays_on_host(dtype: torch.dtype) -> bool:
     """Whether a pooled device read still delivers this feature to the host.
 
@@ -579,6 +589,11 @@ class MooncakeFeatureStore(FeatureStore):
             put_config = _InjectedReplicateConfig()
         _require_store_api(store)
         self._store = store
+        # Optional master-side object size probe (binding name ``get_size``,
+        # getSize in C++). Powers the corruption pre-check in ``_get_tensors``;
+        # older wheels without it degrade to the raw get_into failure path.
+        get_size = getattr(store, "get_size", None)
+        self._get_size = get_size if callable(get_size) else None
         if max_quarantined_bytes < 0:
             raise ValueError("max_quarantined_bytes must be >= 0")
         self.max_quarantined_bytes = int(max_quarantined_bytes)
@@ -671,6 +686,27 @@ class MooncakeFeatureStore(FeatureStore):
     # -- store wrappers (status-code aware) --------------------------------
     def _store_exists(self, key: str) -> bool:
         return int(self._store.is_exist(key)) == 1
+
+    def _store_object_size(self, key: str) -> Optional[int]:
+        """Master-side object size in bytes; None if the probe is unavailable.
+
+        ``getSize`` is a master Query, so it takes no read lease on the
+        object's bytes and cannot delay a later physical free the way an
+        is_exist probe does. Returns None on any probe error (a missing
+        object, an RPC failure, or a binding without ``get_size``) -- the
+        pre-check is best-effort; the authoritative validation remains the
+        get_into return count checked by :func:`_check_get_result`.
+        """
+        if self._get_size is None:
+            return None
+        try:
+            rc = self._get_size(key)
+        except Exception:  # pragma: no cover - defensive against binding quirks
+            return None
+        if rc is None:
+            return None
+        rc = int(rc)
+        return rc if rc > 0 else None
 
     def _store_put_tensor(self, key: str, t: torch.Tensor) -> None:
         """Zero-copy publish, requesting a hard pin when the client supports it.
@@ -1109,9 +1145,38 @@ class MooncakeFeatureStore(FeatureStore):
                     f"sample {sid} gen {gen} feature {n!r} not available "
                     f"(freed, stale, or never written)"
                 )
+            self._check_object_size(key, spec, sid=sid, gen=gen, name=n)
             # fresh alloc (or a pooled slot copied out) -> clone-on-fetch for free (B5)
             out[n] = self._fetch_tensor(key, spec, device)
         return out, gen
+
+    def _check_object_size(self, key: str, spec, *, sid: str, gen: int, name: str) -> None:
+        """Reject a stored object whose size disagrees with the ref's spec.
+
+        Mooncake's ``get_into`` fails with only ``INVALID_PARAMS (-600)`` when
+        the receive buffer is smaller than the object, which hides the actual
+        mismatch. The classic cause: a prior run reused this store_id, its
+        deterministic ``g1`` key still holds a longer object, and the
+        OBJECT_ALREADY_EXISTS-is-success put rule let this run's capture
+        commit a ref over it. Compare the master-side size up front and fail
+        with both numbers so the deployment error is diagnosable at first
+        read instead of poisoning a training step.
+        """
+        if self._get_size is None:
+            return
+        actual = self._store_object_size(key)
+        if actual is None:
+            return
+        expected = _spec_nbytes(spec)
+        if actual != expected:
+            raise _MooncakeGetError(
+                f"stored object size mismatch for {key}: object holds {actual} "
+                f"bytes but the ref's spec expects {expected} "
+                f"(shape={tuple(int(d) for d in spec.shape)} dtype={spec.dtype}). "
+                "A stale object from a prior run sharing this store_id is the "
+                "usual cause; restart the producer with a fresh run_id/store_id "
+                "or clear the Mooncake master's objects for this prefix."
+            )
 
     # -- lifetime ----------------------------------------------------------
     def _try_physical_free(
